@@ -1,5 +1,5 @@
 status = [
-    "ElrondNetwork.wasmer"
+    "DharitriOne.wasmer"
     "continuous-integration/travis-ci/push"
 ]
 required_approvals = 1

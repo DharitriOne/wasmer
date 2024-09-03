@@ -4,7 +4,7 @@ version = "0.15.0"
 description = "Wasmer runtime core library"
 license = "MIT"
 authors = ["The Wasmer Engineering Team <engineering@wasmer.io>"]
-repository = "https://github.com/ElrondNetwork/wasmer"
+repository = "https://github.com/DharitriOne/wasmer"
 keywords = ["wasm", "webassembly", "runtime"]
 categories = ["wasm"]
 edition = "2018"
@@ -12,7 +12,7 @@ edition = "2018"
 [dependencies]
 nix = "0.15"
 page_size = "0.4"
-wasmparser = { git = "https://github.com/ElrondNetwork/wasmparser.rs" }
+wasmparser = { git = "https://github.com/DharitriOne/wasmparser.rs" }
 parking_lot = "0.10.0"
 lazy_static = "1.4"
 errno = "0.2"

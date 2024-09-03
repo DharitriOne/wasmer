@@ -275,7 +275,7 @@ jobs:
         continueOnError: true
         inputs:
           gitHubConnection: 'wasmer'
-          repositoryName: 'ElrondNetwork/wasmer'
+          repositoryName: 'DharitriOne/wasmer'
           action: 'create'
           target: '$(Build.SourceVersion)'
           title: '$(VERSION_TAG)'
