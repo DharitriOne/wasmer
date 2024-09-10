@@ -1,8 +1,11 @@
 //! Builder system for configuring a [`WasiState`] and creating it.
 
-use crate::state::{WasiFile, WasiFs, WasiFsError, WasiState};
+use crate::state::{default_fs_backing, WasiFs, WasiState};
 use crate::syscalls::types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO};
+use crate::WasiEnv;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
+use wasmer_vfs::{FsError, VirtualFile};
 
 /// Creates an empty [`WasiStateBuilder`].
 ///
@@ -18,7 +21,7 @@ pub(crate) fn create_wasi_state(program_name: &str) -> WasiStateBuilder {
 ///
 /// Usage:
 /// ```no_run
-/// # use wasmer_wasi::state::{WasiState, WasiStateCreationError};
+/// # use wasmer_wasi::{WasiState, WasiStateCreationError};
 /// # fn main() -> Result<(), WasiStateCreationError> {
 /// let mut state_builder = WasiState::new("wasi-prog-name");
 /// state_builder
@@ -33,16 +36,20 @@ pub(crate) fn create_wasi_state(program_name: &str) -> WasiStateBuilder {
 #[derive(Default)]
 pub struct WasiStateBuilder {
     args: Vec<Vec<u8>>,
-    envs: Vec<Vec<u8>>,
+    envs: Vec<(Vec<u8>, Vec<u8>)>,
     preopens: Vec<PreopenedDir>,
+    vfs_preopens: Vec<String>,
+    #[allow(clippy::type_complexity)]
     setup_fs_fn: Option<Box<dyn Fn(&mut WasiFs) -> Result<(), String> + Send>>,
-    stdout_override: Option<Box<dyn WasiFile>>,
-    stderr_override: Option<Box<dyn WasiFile>>,
-    stdin_override: Option<Box<dyn WasiFile>>,
+    stdout_override: Option<Box<dyn VirtualFile>>,
+    stderr_override: Option<Box<dyn VirtualFile>>,
+    stdin_override: Option<Box<dyn VirtualFile>>,
+    fs_override: Option<Box<dyn wasmer_vfs::FileSystem>>,
 }
 
 impl std::fmt::Debug for WasiStateBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // TODO: update this when stable
         f.debug_struct("WasiStateBuilder")
             .field("args", &self.args)
             .field("envs", &self.envs)
@@ -56,28 +63,31 @@ impl std::fmt::Debug for WasiStateBuilder {
 }
 
 /// Error type returned when bad data is given to [`WasiStateBuilder`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum WasiStateCreationError {
+    #[error("bad environment variable format: `{0}`")]
     EnvironmentVariableFormatError(String),
+    #[error("argument contains null byte: `{0}`")]
     ArgumentContainsNulByte(String),
+    #[error("preopened directory not found: `{0}`")]
     PreopenedDirectoryNotFound(PathBuf),
+    #[error("preopened directory error: `{0}`")]
     PreopenedDirectoryError(String),
+    #[error("mapped dir alias has wrong format: `{0}`")]
     MappedDirAliasFormattingError(String),
+    #[error("wasi filesystem creation error: `{0}`")]
     WasiFsCreationError(String),
+    #[error("wasi filesystem setup error: `{0}`")]
     WasiFsSetupError(String),
-    WasiFsError(WasiFsError),
+    #[error(transparent)]
+    FileSystemError(FsError),
 }
 
 fn validate_mapped_dir_alias(alias: &str) -> Result<(), WasiStateCreationError> {
-    for byte in alias.bytes() {
-        match byte {
-            b'\0' => {
-                return Err(WasiStateCreationError::MappedDirAliasFormattingError(
-                    format!("Alias \"{}\" contains a nul byte", alias),
-                ));
-            }
-            _ => (),
-        }
+    if !alias.bytes().all(|b| b != b'\0') {
+        return Err(WasiStateCreationError::MappedDirAliasFormattingError(
+            format!("Alias \"{}\" contains a nul byte", alias),
+        ));
     }
 
     Ok(())
@@ -87,85 +97,68 @@ fn validate_mapped_dir_alias(alias: &str) -> Result<(), WasiStateCreationError> 
 // return stdout somehow, it's unclear what that API should look like)
 impl WasiStateBuilder {
     /// Add an environment variable pair.
-    /// Environment variable keys and values must not contain the byte `=` (0x3d)
-    /// or nul (0x0).
+    ///
+    /// Both the key and value of an environment variable must not
+    /// contain a nul byte (`0x0`), and the key must not contain the
+    /// `=` byte (`0x3d`).
     pub fn env<Key, Value>(&mut self, key: Key, value: Value) -> &mut Self
     where
         Key: AsRef<[u8]>,
         Value: AsRef<[u8]>,
     {
-        let key_b = key.as_ref();
-        let val_b = value.as_ref();
-
-        let length = key_b.len() + val_b.len() + 1;
-        let mut byte_vec = Vec::with_capacity(length);
-
-        byte_vec.extend_from_slice(&key_b);
-        byte_vec.push(b'=');
-        byte_vec.extend_from_slice(&val_b);
-
-        self.envs.push(byte_vec);
+        self.envs
+            .push((key.as_ref().to_vec(), value.as_ref().to_vec()));
 
         self
     }
 
     /// Add an argument.
+    ///
     /// Arguments must not contain the nul (0x0) byte
     pub fn arg<Arg>(&mut self, arg: Arg) -> &mut Self
     where
         Arg: AsRef<[u8]>,
     {
-        let arg_b = arg.as_ref();
-        let mut byte_vec = Vec::with_capacity(arg_b.len());
-        byte_vec.extend_from_slice(&arg_b);
-        self.args.push(byte_vec);
+        self.args.push(arg.as_ref().to_vec());
 
         self
     }
 
     /// Add multiple environment variable pairs.
-    /// Keys and values must not contain the `=` (0x3d) or nul (0x0) byte.
+    ///
+    /// Both the key and value of the environment variables must not
+    /// contain a nul byte (`0x0`), and the key must not contain the
+    /// `=` byte (`0x3d`).
     pub fn envs<I, Key, Value>(&mut self, env_pairs: I) -> &mut Self
     where
         I: IntoIterator<Item = (Key, Value)>,
         Key: AsRef<[u8]>,
         Value: AsRef<[u8]>,
     {
-        for (key, value) in env_pairs {
-            let key_b = key.as_ref();
-            let val_b = value.as_ref();
-
-            let length = key_b.len() + val_b.len() + 1;
-            let mut byte_vec = Vec::with_capacity(length);
-
-            byte_vec.extend_from_slice(&key_b);
-            byte_vec.push(b'=');
-            byte_vec.extend_from_slice(&val_b);
-
-            self.envs.push(byte_vec);
-        }
+        env_pairs.into_iter().for_each(|(key, value)| {
+            self.env(key, value);
+        });
 
         self
     }
 
     /// Add multiple arguments.
+    ///
     /// Arguments must not contain the nul (0x0) byte
     pub fn args<I, Arg>(&mut self, args: I) -> &mut Self
     where
         I: IntoIterator<Item = Arg>,
         Arg: AsRef<[u8]>,
     {
-        for arg in args {
-            let arg_b = arg.as_ref();
-            let mut byte_vec = Vec::with_capacity(arg_b.len());
-            byte_vec.extend_from_slice(&arg_b);
-            self.args.push(byte_vec);
-        }
+        args.into_iter().for_each(|arg| {
+            self.arg(arg);
+        });
 
         self
     }
 
     /// Preopen a directory
+    ///
     /// This opens the given directory at the virtual root, `/`, and allows
     /// the WASI module to read and write to the given directory.
     pub fn preopen_dir<FilePath>(
@@ -190,7 +183,7 @@ impl WasiStateBuilder {
     /// Usage:
     ///
     /// ```no_run
-    /// # use wasmer_wasi::state::{WasiState, WasiStateCreationError};
+    /// # use wasmer_wasi::{WasiState, WasiStateCreationError};
     /// # fn main() -> Result<(), WasiStateCreationError> {
     /// WasiState::new("program_name")
     ///    .preopen(|p| p.directory("src").read(true).write(true).create(true))?
@@ -211,7 +204,8 @@ impl WasiStateBuilder {
         Ok(self)
     }
 
-    /// Preopen a directory
+    /// Preopen a directory.
+    ///
     /// This opens the given directory at the virtual root, `/`, and allows
     /// the WASI module to read and write to the given directory.
     pub fn preopen_dirs<I, FilePath>(
@@ -224,6 +218,19 @@ impl WasiStateBuilder {
     {
         for po_dir in po_dirs {
             self.preopen_dir(po_dir)?;
+        }
+
+        Ok(self)
+    }
+
+    /// Preopen the given directories from the
+    /// Virtual FS.
+    pub fn preopen_vfs_dirs<I>(&mut self, po_dirs: I) -> Result<&mut Self, WasiStateCreationError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for po_dir in po_dirs {
+            self.vfs_preopens.push(po_dir);
         }
 
         Ok(self)
@@ -270,7 +277,7 @@ impl WasiStateBuilder {
 
     /// Overwrite the default WASI `stdout`, if you want to hold on to the
     /// original `stdout` use [`WasiFs::swap_file`] after building.
-    pub fn stdout(&mut self, new_file: Box<dyn WasiFile>) -> &mut Self {
+    pub fn stdout(&mut self, new_file: Box<dyn VirtualFile>) -> &mut Self {
         self.stdout_override = Some(new_file);
 
         self
@@ -278,7 +285,7 @@ impl WasiStateBuilder {
 
     /// Overwrite the default WASI `stderr`, if you want to hold on to the
     /// original `stderr` use [`WasiFs::swap_file`] after building.
-    pub fn stderr(&mut self, new_file: Box<dyn WasiFile>) -> &mut Self {
+    pub fn stderr(&mut self, new_file: Box<dyn VirtualFile>) -> &mut Self {
         self.stderr_override = Some(new_file);
 
         self
@@ -286,13 +293,22 @@ impl WasiStateBuilder {
 
     /// Overwrite the default WASI `stdin`, if you want to hold on to the
     /// original `stdin` use [`WasiFs::swap_file`] after building.
-    pub fn stdin(&mut self, new_file: Box<dyn WasiFile>) -> &mut Self {
+    pub fn stdin(&mut self, new_file: Box<dyn VirtualFile>) -> &mut Self {
         self.stdin_override = Some(new_file);
 
         self
     }
 
-    /// Setup the WASI filesystem before running
+    /// Sets the FileSystem to be used with this WASI instance.
+    ///
+    /// This is usually used in case a custom `wasmer_vfs::FileSystem` is needed.
+    pub fn set_fs(&mut self, fs: Box<dyn wasmer_vfs::FileSystem>) -> &mut Self {
+        self.fs_override = Some(fs);
+
+        self
+    }
+
+    /// Configure the WASI filesystem before running.
     // TODO: improve ergonomics on this function
     pub fn setup_fs(
         &mut self,
@@ -306,6 +322,22 @@ impl WasiStateBuilder {
     /// Consumes the [`WasiStateBuilder`] and produces a [`WasiState`]
     ///
     /// Returns the error from `WasiFs::new` if there's an error
+    ///
+    /// # Calling `build` multiple times
+    ///
+    /// Calling this method multiple times might not produce a
+    /// determinisic result. This method is changing the builder's
+    /// internal state. The values set with the following methods are
+    /// reset to their defaults:
+    ///
+    /// * [Self::set_fs],
+    /// * [Self::stdin],
+    /// * [Self::stdout],
+    /// * [Self::stderr].
+    ///
+    /// Ideally, the builder must be refactord to update `&mut self`
+    /// to `mut self` for every _builder method_, but it will break
+    /// existing code. It will be addressed in a next major release.
     pub fn build(&mut self) -> Result<WasiState, WasiStateCreationError> {
         for (i, arg) in self.args.iter().enumerate() {
             for b in arg.iter() {
@@ -322,66 +354,117 @@ impl WasiStateBuilder {
                 }
             }
         }
-        for env in self.envs.iter() {
-            let mut eq_seen = false;
-            for b in env.iter() {
-                match *b {
-                    b'=' => {
-                        if eq_seen {
-                            return Err(WasiStateCreationError::EnvironmentVariableFormatError(
-                                format!(
-                                    "found '=' in env var string \"{}\" (key=value)",
-                                    std::str::from_utf8(env)
-                                        .unwrap_or("Inner error: env var is invalid_utf8!")
-                                ),
-                            ));
-                        }
-                        eq_seen = true;
-                    }
-                    0 => {
-                        return Err(WasiStateCreationError::EnvironmentVariableFormatError(
-                            format!(
-                                "found nul byte in env var string \"{}\" (key=value)",
-                                std::str::from_utf8(env)
-                                    .unwrap_or("Inner error: env var is invalid_utf8!")
-                            ),
-                        ));
-                    }
-                    _ => (),
+
+        enum InvalidCharacter {
+            Nul,
+            Equal,
+        }
+
+        for (env_key, env_value) in self.envs.iter() {
+            match env_key.iter().find_map(|&ch| {
+                if ch == 0 {
+                    Some(InvalidCharacter::Nul)
+                } else if ch == b'=' {
+                    Some(InvalidCharacter::Equal)
+                } else {
+                    None
                 }
+            }) {
+                Some(InvalidCharacter::Nul) => {
+                    return Err(WasiStateCreationError::EnvironmentVariableFormatError(
+                        format!(
+                            "found nul byte in env var key \"{}\" (key=value)",
+                            String::from_utf8_lossy(env_key)
+                        ),
+                    ))
+                }
+
+                Some(InvalidCharacter::Equal) => {
+                    return Err(WasiStateCreationError::EnvironmentVariableFormatError(
+                        format!(
+                            "found equal sign in env var key \"{}\" (key=value)",
+                            String::from_utf8_lossy(env_key)
+                        ),
+                    ))
+                }
+
+                None => (),
+            }
+
+            if env_value.iter().any(|&ch| ch == 0) {
+                return Err(WasiStateCreationError::EnvironmentVariableFormatError(
+                    format!(
+                        "found nul byte in env var value \"{}\" (key=value)",
+                        String::from_utf8_lossy(env_value)
+                    ),
+                ));
             }
         }
 
-        // self.preopens are checked in [`PreopenDirBuilder::build`]
+        let fs_backing = self
+            .fs_override
+            .take()
+            .unwrap_or_else(|| default_fs_backing());
 
-        // this deprecation warning only applies to external callers
-        #[allow(deprecated)]
-        let mut wasi_fs = WasiFs::new_with_preopen(&self.preopens)
+        // self.preopens are checked in [`PreopenDirBuilder::build`]
+        let mut wasi_fs = WasiFs::new_with_preopen(&self.preopens, &self.vfs_preopens, fs_backing)
             .map_err(WasiStateCreationError::WasiFsCreationError)?;
+
         // set up the file system, overriding base files and calling the setup function
         if let Some(stdin_override) = self.stdin_override.take() {
             wasi_fs
                 .swap_file(__WASI_STDIN_FILENO, stdin_override)
-                .map_err(WasiStateCreationError::WasiFsError)?;
+                .map_err(WasiStateCreationError::FileSystemError)?;
         }
+
         if let Some(stdout_override) = self.stdout_override.take() {
             wasi_fs
                 .swap_file(__WASI_STDOUT_FILENO, stdout_override)
-                .map_err(WasiStateCreationError::WasiFsError)?;
+                .map_err(WasiStateCreationError::FileSystemError)?;
         }
+
         if let Some(stderr_override) = self.stderr_override.take() {
             wasi_fs
                 .swap_file(__WASI_STDERR_FILENO, stderr_override)
-                .map_err(WasiStateCreationError::WasiFsError)?;
+                .map_err(WasiStateCreationError::FileSystemError)?;
         }
+
         if let Some(f) = &self.setup_fs_fn {
             f(&mut wasi_fs).map_err(WasiStateCreationError::WasiFsSetupError)?;
         }
+
         Ok(WasiState {
             fs: wasi_fs,
             args: self.args.clone(),
-            envs: self.envs.clone(),
+            envs: self
+                .envs
+                .iter()
+                .map(|(key, value)| {
+                    let mut env = Vec::with_capacity(key.len() + value.len() + 1);
+                    env.extend_from_slice(&key);
+                    env.push(b'=');
+                    env.extend_from_slice(&value);
+
+                    env
+                })
+                .collect(),
         })
+    }
+
+    /// Consumes the [`WasiStateBuilder`] and produces a [`WasiEnv`]
+    ///
+    /// Returns the error from `WasiFs::new` if there's an error.
+    ///
+    /// # Calling `finalize` multiple times
+    ///
+    /// Calling this method multiple times might not produce a
+    /// determinisic result. This method is calling [Self::build],
+    /// which is changing the builder's internal state. See
+    /// [Self::build]'s documentation to learn more.
+    pub fn finalize(&mut self) -> Result<WasiEnv, WasiStateCreationError> {
+        let state = self.build()?;
+
+        Ok(WasiEnv::new(state))
     }
 }
 
@@ -424,6 +507,9 @@ impl PreopenDirBuilder {
 
     /// Make this preopened directory appear to the WASI program as `alias`
     pub fn alias(&mut self, alias: &str) -> &mut Self {
+        // We mount at preopened dirs at `/` by default and multiple `/` in a row
+        // are equal to a single `/`.
+        let alias = alias.trim_start_matches('/');
         self.alias = Some(alias.to_string());
 
         self
@@ -468,9 +554,12 @@ impl PreopenDirBuilder {
         }
         let path = self.path.clone().unwrap();
 
+        /*
         if !path.exists() {
             return Err(WasiStateCreationError::PreopenedDirectoryNotFound(path));
         }
+        */
+
         if let Some(alias) = &self.alias {
             validate_mapped_dir_alias(alias)?;
         }
@@ -491,21 +580,41 @@ mod test {
 
     #[test]
     fn env_var_errors() {
-        let output = create_wasi_state("test_prog")
-            .env("HOM=E", "/home/home")
-            .build();
-        match output {
-            Err(WasiStateCreationError::EnvironmentVariableFormatError(_)) => assert!(true),
-            _ => assert!(false),
-        }
+        // `=` in the key is invalid.
+        assert!(
+            create_wasi_state("test_prog")
+                .env("HOM=E", "/home/home")
+                .build()
+                .is_err(),
+            "equal sign in key must be invalid"
+        );
 
-        let output = create_wasi_state("test_prog")
-            .env("HOME\0", "/home/home")
-            .build();
-        match output {
-            Err(WasiStateCreationError::EnvironmentVariableFormatError(_)) => assert!(true),
-            _ => assert!(false),
-        }
+        // `\0` in the key is invalid.
+        assert!(
+            create_wasi_state("test_prog")
+                .env("HOME\0", "/home/home")
+                .build()
+                .is_err(),
+            "nul in key must be invalid"
+        );
+
+        // `=` in the value is valid.
+        assert!(
+            create_wasi_state("test_prog")
+                .env("HOME", "/home/home=home")
+                .build()
+                .is_ok(),
+            "equal sign in the value must be valid"
+        );
+
+        // `\0` in the value is invalid.
+        assert!(
+            create_wasi_state("test_prog")
+                .env("HOME", "/home/home\0")
+                .build()
+                .is_err(),
+            "nul in value must be invalid"
+        );
     }
 
     #[test]

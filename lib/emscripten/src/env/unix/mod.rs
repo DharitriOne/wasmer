@@ -3,7 +3,6 @@ use libc::{
     c_int, getenv, getgrnam as libc_getgrnam, getpwnam as libc_getpwnam, putenv, setenv, sysconf,
     unsetenv,
 };
-use std::cell::Cell;
 use std::ffi::CStr;
 use std::mem;
 use std::os::raw::c_char;
@@ -11,11 +10,11 @@ use std::os::raw::c_char;
 use crate::env::{call_malloc, call_malloc_with_cast, EmAddrInfo, EmSockAddr};
 use crate::ptr::{Array, WasmPtr};
 use crate::utils::{copy_cstr_into_wasm, copy_terminated_array_of_cstrs};
-use wasmer_runtime_core::vm::Ctx;
+use crate::EmEnv;
 
 // #[no_mangle]
 /// emscripten: _getenv // (name: *const char) -> *const c_char;
-pub fn _getenv(ctx: &mut Ctx, name: i32) -> u32 {
+pub fn _getenv(ctx: &EmEnv, name: i32) -> u32 {
     debug!("emscripten::_getenv");
 
     let name_addr = emscripten_memory_pointer!(ctx.memory(0), name) as *const c_char;
@@ -31,7 +30,7 @@ pub fn _getenv(ctx: &mut Ctx, name: i32) -> u32 {
 }
 
 /// emscripten: _setenv // (name: *const char, name: *const value, overwrite: int);
-pub fn _setenv(ctx: &mut Ctx, name: c_int, value: c_int, overwrite: c_int) -> c_int {
+pub fn _setenv(ctx: &EmEnv, name: c_int, value: c_int, overwrite: c_int) -> c_int {
     debug!("emscripten::_setenv");
 
     let name_addr = emscripten_memory_pointer!(ctx.memory(0), name) as *const c_char;
@@ -44,7 +43,7 @@ pub fn _setenv(ctx: &mut Ctx, name: c_int, value: c_int, overwrite: c_int) -> c_
 }
 
 /// emscripten: _putenv // (name: *const char);
-pub fn _putenv(ctx: &mut Ctx, name: c_int) -> c_int {
+pub fn _putenv(ctx: &EmEnv, name: c_int) -> c_int {
     debug!("emscripten::_putenv");
 
     let name_addr = emscripten_memory_pointer!(ctx.memory(0), name) as *const c_char;
@@ -55,7 +54,7 @@ pub fn _putenv(ctx: &mut Ctx, name: c_int) -> c_int {
 }
 
 /// emscripten: _unsetenv // (name: *const char);
-pub fn _unsetenv(ctx: &mut Ctx, name: c_int) -> c_int {
+pub fn _unsetenv(ctx: &EmEnv, name: c_int) -> c_int {
     debug!("emscripten::_unsetenv");
 
     let name_addr = emscripten_memory_pointer!(ctx.memory(0), name) as *const c_char;
@@ -66,7 +65,7 @@ pub fn _unsetenv(ctx: &mut Ctx, name: c_int) -> c_int {
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-pub fn _getpwnam(ctx: &mut Ctx, name_ptr: c_int) -> c_int {
+pub fn _getpwnam(ctx: &EmEnv, name_ptr: c_int) -> c_int {
     debug!("emscripten::_getpwnam {}", name_ptr);
     #[cfg(feature = "debug")]
     let _ = name_ptr;
@@ -106,7 +105,7 @@ pub fn _getpwnam(ctx: &mut Ctx, name_ptr: c_int) -> c_int {
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-pub fn _getgrnam(ctx: &mut Ctx, name_ptr: c_int) -> c_int {
+pub fn _getgrnam(ctx: &EmEnv, name_ptr: c_int) -> c_int {
     debug!("emscripten::_getgrnam {}", name_ptr);
 
     #[repr(C)]
@@ -137,25 +136,22 @@ pub fn _getgrnam(ctx: &mut Ctx, name_ptr: c_int) -> c_int {
     }
 }
 
-pub fn _sysconf(_ctx: &mut Ctx, name: c_int) -> i32 {
+pub fn _sysconf(_ctx: &EmEnv, name: c_int) -> i32 {
     debug!("emscripten::_sysconf {}", name);
     // TODO: Implement like emscripten expects regarding memory/page size
     unsafe { sysconf(name) as i32 } // TODO review i64
 }
 
 // this may be a memory leak, probably not though because emscripten does the same thing
-pub fn _gai_strerror(ctx: &mut Ctx, ecode: i32) -> i32 {
+pub fn _gai_strerror(ctx: &EmEnv, ecode: i32) -> i32 {
     debug!("emscripten::_gai_strerror({})", ecode);
 
     let cstr = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(ecode)) };
     let bytes = cstr.to_bytes_with_nul();
     let string_on_guest: WasmPtr<c_char, Array> = call_malloc_with_cast(ctx, bytes.len() as _);
+    let memory = ctx.memory(0);
 
-    let writer = unsafe {
-        string_on_guest
-            .deref_mut(ctx.memory(0), 0, bytes.len() as _)
-            .unwrap()
-    };
+    let writer = string_on_guest.deref(&memory, 0, bytes.len() as _).unwrap();
     for (i, byte) in bytes.iter().enumerate() {
         writer[i].set(*byte as _);
     }
@@ -164,7 +160,7 @@ pub fn _gai_strerror(ctx: &mut Ctx, ecode: i32) -> i32 {
 }
 
 pub fn _getaddrinfo(
-    ctx: &mut Ctx,
+    ctx: &EmEnv,
     node_ptr: WasmPtr<c_char>,
     service_str_ptr: WasmPtr<c_char>,
     hints_ptr: WasmPtr<EmAddrInfo>,
@@ -173,26 +169,28 @@ pub fn _getaddrinfo(
     use libc::{addrinfo, freeaddrinfo};
     debug!("emscripten::_getaddrinfo");
     let memory = ctx.memory(0);
-    debug!(" => node = {}", unsafe {
+    debug!(" => node = {}", {
         node_ptr
-            .deref(memory)
-            .map(|np| {
-                std::ffi::CStr::from_ptr(np as *const Cell<c_char> as *const c_char)
-                    .to_string_lossy()
+            .deref(&memory)
+            .map(|_np| {
+                unimplemented!();
+                // std::ffi::CStr::from_ptr(np as *const Cell<c_char> as *const c_char)
+                //     .to_string_lossy()
             })
             .unwrap_or(std::borrow::Cow::Borrowed("null"))
     });
-    debug!(" => server_str = {}", unsafe {
+    debug!(" => server_str = {}", {
         service_str_ptr
-            .deref(memory)
-            .map(|np| {
-                std::ffi::CStr::from_ptr(np as *const Cell<c_char> as *const c_char)
-                    .to_string_lossy()
+            .deref(&memory)
+            .map(|_np| {
+                unimplemented!();
+                // std::ffi::CStr::from_ptr(np as *const Cell<c_char> as *const c_char)
+                //     .to_string_lossy()
             })
             .unwrap_or(std::borrow::Cow::Borrowed("null"))
     });
 
-    let hints = hints_ptr.deref(memory).map(|hints_memory| {
+    let hints = hints_ptr.deref(&memory).map(|hints_memory| {
         let hints_guest = hints_memory.get();
         addrinfo {
             ai_flags: hints_guest.ai_flags,
@@ -211,13 +209,17 @@ pub fn _getaddrinfo(
     // allocate equivalent memory for res_val_ptr
     let result = unsafe {
         libc::getaddrinfo(
-            (node_ptr
-                .deref(memory)
-                .map(|m| m as *const Cell<c_char> as *const c_char))
+            (node_ptr.deref(&memory).map(|_m| {
+                unimplemented!();
+                //m as *const Cell<c_char> as *const c_char
+            }))
             .unwrap_or(std::ptr::null()),
             service_str_ptr
-                .deref(memory)
-                .map(|m| m as *const Cell<c_char> as *const c_char)
+                .deref(&memory)
+                .map(|_m| {
+                    unimplemented!();
+                    // m as *const Cell<c_char> as *const c_char
+                })
                 .unwrap_or(std::ptr::null()),
             hints
                 .as_ref()
@@ -245,8 +247,10 @@ pub fn _getaddrinfo(
 
             // connect list
             if let Some(prev_guest) = previous_guest_node {
-                let mut pg = prev_guest.deref_mut(ctx.memory(0)).unwrap().get_mut();
+                let derefed_prev_guest = prev_guest.deref(&memory).unwrap();
+                let mut pg = derefed_prev_guest.get();
                 pg.ai_next = current_guest_node_ptr;
+                derefed_prev_guest.set(pg);
             }
 
             // update values
@@ -257,13 +261,13 @@ pub fn _getaddrinfo(
                 let host_sockaddr_ptr = (*current_host_node).ai_addr;
                 let guest_sockaddr_ptr: WasmPtr<EmSockAddr> =
                     call_malloc_with_cast(ctx, host_addrlen as _);
-                let guest_sockaddr = guest_sockaddr_ptr
-                    .deref_mut(ctx.memory(0))
-                    .unwrap()
-                    .get_mut();
 
-                guest_sockaddr.sa_family = (*host_sockaddr_ptr).sa_family as i16;
-                guest_sockaddr.sa_data = (*host_sockaddr_ptr).sa_data.clone();
+                let derefed_guest_sockaddr = guest_sockaddr_ptr.deref(&memory).unwrap();
+                let mut gs = derefed_guest_sockaddr.get();
+                gs.sa_family = (*host_sockaddr_ptr).sa_family as i16;
+                gs.sa_data = (*host_sockaddr_ptr).sa_data;
+                derefed_guest_sockaddr.set(gs);
+
                 guest_sockaddr_ptr
             };
 
@@ -277,9 +281,8 @@ pub fn _getaddrinfo(
                     let guest_canonname: WasmPtr<c_char, Array> =
                         call_malloc_with_cast(ctx, str_size as _);
 
-                    let guest_canonname_writer = guest_canonname
-                        .deref(ctx.memory(0), 0, str_size as _)
-                        .unwrap();
+                    let guest_canonname_writer =
+                        guest_canonname.deref(&memory, 0, str_size as _).unwrap();
                     for (i, b) in canonname_bytes.into_iter().enumerate() {
                         guest_canonname_writer[i].set(*b as _)
                     }
@@ -290,28 +293,27 @@ pub fn _getaddrinfo(
                 }
             };
 
-            let mut current_guest_node = current_guest_node_ptr
-                .deref_mut(ctx.memory(0))
-                .unwrap()
-                .get_mut();
-            current_guest_node.ai_flags = (*current_host_node).ai_flags;
-            current_guest_node.ai_family = (*current_host_node).ai_family;
-            current_guest_node.ai_socktype = (*current_host_node).ai_socktype;
-            current_guest_node.ai_protocol = (*current_host_node).ai_protocol;
-            current_guest_node.ai_addrlen = host_addrlen;
-            current_guest_node.ai_addr = guest_sockaddr_ptr;
-            current_guest_node.ai_canonname = guest_canonname_ptr;
-            current_guest_node.ai_next = WasmPtr::new(0);
+            let derefed_current_guest_node = current_guest_node_ptr.deref(&memory).unwrap();
+            let mut cgn = derefed_current_guest_node.get();
+            cgn.ai_flags = (*current_host_node).ai_flags;
+            cgn.ai_family = (*current_host_node).ai_family;
+            cgn.ai_socktype = (*current_host_node).ai_socktype;
+            cgn.ai_protocol = (*current_host_node).ai_protocol;
+            cgn.ai_addrlen = host_addrlen;
+            cgn.ai_addr = guest_sockaddr_ptr;
+            cgn.ai_canonname = guest_canonname_ptr;
+            cgn.ai_next = WasmPtr::new(0);
+            derefed_current_guest_node.set(cgn);
 
             previous_guest_node = Some(current_guest_node_ptr);
             current_host_node = (*current_host_node).ai_next;
         }
         // this frees all connected nodes on the linked list
         freeaddrinfo(out_ptr);
-        head_of_list.unwrap_or(WasmPtr::new(0))
+        head_of_list.unwrap_or_else(|| WasmPtr::new(0))
     };
 
-    res_val_ptr.deref(ctx.memory(0)).unwrap().set(head_of_list);
+    res_val_ptr.deref(&memory).unwrap().set(head_of_list);
 
     0
 }
